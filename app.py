@@ -6,7 +6,7 @@ import numpy as np
 
 st.set_page_config(page_title="RAG Chat AI", page_icon="💬", layout="centered")
 st.title("💬 RAG Chat AI")
-st.caption("Upload PDFs → Chat with your documents like ChatGPT")
+st.caption("Upload PDFs → Chat with your documents + General AI Knowledge")
 
 # ========== API SETUP ==========
 import os
@@ -64,6 +64,18 @@ with st.sidebar:
     
     if embedder:
         st.success("✅ Local Embedder Ready")
+    
+    st.divider()
+    
+    # MODE TOGGLE
+    st.subheader("🎛️ Answer Mode")
+    answer_mode = st.radio(
+        "Choose how the AI answers:",
+        ["🧠 Hybrid (PDF + General Knowledge)", "📄 Documents Only"],
+        index=0,
+        help="Hybrid = uses PDFs when relevant, general knowledge otherwise. Documents Only = strictly from uploaded PDFs."
+    )
+    hybrid_mode = (answer_mode == "🧠 Hybrid (PDF + General Knowledge)")
     
     st.divider()
     
@@ -172,9 +184,8 @@ if not st.session_state.ready:
     st.markdown("""
     ### 💡 How it works:
     1. Upload your PDF documents in the sidebar
-    2. Click **Process Documents** — the AI reads and learns your files
-    3. Ask questions in the chat box below
-    4. The AI answers based ONLY on your documents
+    2. Click **Process Documents**
+    3. Ask questions — the AI uses your PDFs when relevant, and general knowledge for everything else!
     """)
     st.stop()
 
@@ -186,16 +197,22 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         
-        # Show source chunks for assistant messages
-        if message["role"] == "assistant" and "sources" in message:
-            with st.expander("📄 View source chunks"):
-                for src in message["sources"]:
-                    st.markdown(f"**Chunk** (score: {src['score']:.3f})")
-                    st.text(src["text"][:600])
-                    st.divider()
+        # Show source badge for assistant messages
+        if message["role"] == "assistant":
+            if message.get("source_type") == "document":
+                st.caption("📄 Answered from uploaded documents")
+            elif message.get("source_type") == "general":
+                st.caption("🧠 Answered from general knowledge")
+            
+            if "sources" in message and message["sources"]:
+                with st.expander("📄 View source chunks"):
+                    for src in message["sources"]:
+                        st.markdown(f"**Chunk** (score: {src['score']:.3f})")
+                        st.text(src["text"][:600])
+                        st.divider()
 
 # Chat input at the bottom
-if prompt := st.chat_input("Ask anything about your documents..."):
+if prompt := st.chat_input("Ask anything about your documents... or anything else!"):
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     
@@ -218,12 +235,17 @@ if prompt := st.chat_input("Ask anything about your documents..."):
                     sims.append(sim)
                 
                 top_idx = np.argsort(sims)[-3:][::-1]
+                top_scores = [sims[i] for i in top_idx]
                 
-                # 3. Build context
+                # 3. Check if documents are actually relevant
+                best_score = top_scores[0] if top_scores else 0
+                is_relevant = best_score > 0.55  # Threshold for document relevance
+                
+                # 4. Build context
                 relevant_chunks = [st.session_state.chunks[i] for i in top_idx]
                 context = "\n\n---\n\n".join(relevant_chunks)
                 
-                # 4. Build chat-aware prompt
+                # 5. Build chat-aware prompt based on mode
                 recent_history = ""
                 if len(st.session_state.messages) > 2:
                     recent = st.session_state.messages[-6:-1]
@@ -232,9 +254,41 @@ if prompt := st.chat_input("Ask anything about your documents..."):
                         for m in recent
                     ])
                 
-                if recent_history:
-                    system_prompt = f"""You are a helpful study assistant. Answer using ONLY the context below.
-If not found, say: "I don't have enough information in the uploaded documents to answer this."
+                if hybrid_mode:
+                    # HYBRID MODE: Use docs when relevant, general knowledge otherwise
+                    if is_relevant:
+                        system_prompt = f"""You are a helpful assistant. The user has uploaded documents that may contain relevant information. 
+Use the document context below to answer if it helps. If the documents don't fully answer the question, supplement with your general knowledge.
+
+=== RELEVANT DOCUMENT CONTEXT ===
+{context}
+
+=== RECENT CONVERSATION ===
+{recent_history}
+
+=== USER QUESTION ===
+{prompt}
+
+=== YOUR ANSWER ===
+Provide a clear, accurate, and helpful answer. When using information from the documents, be precise."""
+                        source_type = "document"
+                    else:
+                        system_prompt = f"""You are a helpful assistant. The user asked a question that doesn't seem related to their uploaded documents. 
+Answer using your general knowledge. Be helpful and accurate.
+
+=== RECENT CONVERSATION ===
+{recent_history}
+
+=== USER QUESTION ===
+{prompt}
+
+=== YOUR ANSWER ===
+Provide a clear, accurate, and helpful answer."""
+                        source_type = "general"
+                else:
+                    # STRICT MODE: Only from documents
+                    system_prompt = f"""You are a helpful study assistant. Answer the user's question using ONLY the information provided in the context below.
+If the answer is not found in the context, say: "I don't have enough information in the uploaded documents to answer this."
 
 === CONTEXT FROM DOCUMENTS ===
 {context}
@@ -247,20 +301,9 @@ If not found, say: "I don't have enough information in the uploaded documents to
 
 === YOUR ANSWER ===
 Provide a clear, accurate, and concise answer."""
-                else:
-                    system_prompt = f"""You are a helpful study assistant. Answer using ONLY the context below.
-If not found, say: "I don't have enough information in the uploaded documents to answer this."
-
-=== CONTEXT FROM DOCUMENTS ===
-{context}
-
-=== USER QUESTION ===
-{prompt}
-
-=== YOUR ANSWER ===
-Provide a clear, accurate, and concise answer."""
+                    source_type = "document" if is_relevant else "general"
                 
-                # 5. Call Groq
+                # 6. Call Groq
                 chat_completion = groq_client.chat.completions.create(
                     messages=[{"role": "user", "content": system_prompt}],
                     model="llama-3.3-70b-versatile",
@@ -270,28 +313,34 @@ Provide a clear, accurate, and concise answer."""
                 
                 answer = chat_completion.choices[0].message.content
                 
-                # 6. Prepare sources
+                # 7. Prepare sources (only if documents were relevant)
                 sources = []
-                for i, idx in enumerate(top_idx):
-                    sources.append({
-                        "text": st.session_state.chunks[idx],
-                        "score": sims[idx]
-                    })
+                if is_relevant:
+                    for i, idx in enumerate(top_idx):
+                        sources.append({
+                            "text": st.session_state.chunks[idx],
+                            "score": sims[idx]
+                        })
                 
-                # 7. Display answer
+                # 8. Display answer
                 st.markdown(answer)
                 
-                with st.expander("📄 View source chunks"):
-                    for src in sources:
-                        st.markdown(f"**Chunk** (score: {src['score']:.3f})")
-                        st.text(src["text"][:600])
-                        st.divider()
+                if is_relevant and sources:
+                    st.caption("📄 Answered from uploaded documents")
+                    with st.expander("📄 View source chunks"):
+                        for src in sources:
+                            st.markdown(f"**Chunk** (score: {src['score']:.3f})")
+                            st.text(src["text"][:600])
+                            st.divider()
+                else:
+                    st.caption("🧠 Answered from general knowledge")
                 
-                # 8. Save to history
+                # 9. Save to history
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": answer,
-                    "sources": sources
+                    "sources": sources if is_relevant else [],
+                    "source_type": source_type
                 })
             
             except Exception as e:
