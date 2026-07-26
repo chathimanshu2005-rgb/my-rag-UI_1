@@ -1,8 +1,8 @@
 import streamlit as st
-from google import genai
+from groq import Groq
+from fastembed import TextEmbedding
 from pypdf import PdfReader
 import numpy as np
-import time
 
 st.set_page_config(page_title="RAG Chat AI", page_icon="💬", layout="centered")
 st.title("💬 RAG Chat AI")
@@ -25,7 +25,6 @@ if not groq_key:
 
 if groq_key:
     try:
-        from groq import Groq
         groq_client = Groq(api_key=groq_key)
     except Exception as e:
         st.sidebar.error(f"Groq Error: {e}")
@@ -34,7 +33,6 @@ if groq_key:
 @st.cache_resource
 def load_embedder():
     with st.spinner("Loading embedding model (22MB, one-time)..."):
-        from fastembed import TextEmbedding
         return TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
 embedder = None
@@ -225,17 +223,18 @@ if prompt := st.chat_input("Ask anything about your documents..."):
                 relevant_chunks = [st.session_state.chunks[i] for i in top_idx]
                 context = "\n\n---\n\n".join(relevant_chunks)
                 
-                # 4. Build chat-aware prompt (includes recent history for context)
+                # 4. Build chat-aware prompt
                 recent_history = ""
                 if len(st.session_state.messages) > 2:
-                    recent = st.session_state.messages[-6:-1]  # Last 3 exchanges
+                    recent = st.session_state.messages[-6:-1]
                     recent_history = "\n\n".join([
                         f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
                         for m in recent
                     ])
                 
-                system_prompt = f"""You are a helpful study assistant. Answer the user's question using ONLY the information provided in the context below.
-If the answer is not found in the context, say: "I don't have enough information in the uploaded documents to answer this."
+                if recent_history:
+                    system_prompt = f"""You are a helpful study assistant. Answer using ONLY the context below.
+If not found, say: "I don't have enough information in the uploaded documents to answer this."
 
 === CONTEXT FROM DOCUMENTS ===
 {context}
@@ -247,8 +246,10 @@ If the answer is not found in the context, say: "I don't have enough information
 {prompt}
 
 === YOUR ANSWER ===
-Provide a clear, accurate, and concise answer.""" if recent_history else f"""You are a helpful study assistant. Answer the user's question using ONLY the information provided in the context below.
-If the answer is not found in the context, say: "I don't have enough information in the uploaded documents to answer this."
+Provide a clear, accurate, and concise answer."""
+                else:
+                    system_prompt = f"""You are a helpful study assistant. Answer using ONLY the context below.
+If not found, say: "I don't have enough information in the uploaded documents to answer this."
 
 === CONTEXT FROM DOCUMENTS ===
 {context}
