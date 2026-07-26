@@ -1,266 +1,301 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
 from pypdf import PdfReader
 import numpy as np
+import time
 
-# ========== PAGE SETUP ==========
-st.set_page_config(page_title="My RAG App", page_icon="📚", layout="centered")
+st.set_page_config(page_title="RAG Chat AI", page_icon="💬", layout="centered")
+st.title("💬 RAG Chat AI")
+st.caption("Upload PDFs → Chat with your documents like ChatGPT")
 
-st.title("📚 My Free RAG Application")
-st.markdown("""
-**Upload PDF documents → Ask questions → Get AI answers based ONLY on your documents**
-
-*Built with 100% free tools: Streamlit + Gemini API + Python*
-""")
-
-# ========== GEMINI SETUP ==========
+# ========== API SETUP ==========
 import os
 
-# Try to get API key from multiple sources
+groq_key = None
+groq_client = None
+
 try:
-    # Source 1: Streamlit Cloud secrets
-    api_key = st.secrets.get("GEMINI_API_KEY", None)
+    if "GROQ_API_KEY" in st.secrets:
+        groq_key = st.secrets["GROQ_API_KEY"]
+except Exception:
+    pass
 
-    # Source 2: Environment variable (for local)
-    if not api_key:
-        api_key = os.getenv("GEMINI_API_KEY")
+if not groq_key:
+    groq_key = os.getenv("GROQ_API_KEY")
 
-    # Source 3: Direct input (emergency fallback)
-    if not api_key:
-        st.warning("⚠️ API Key not found in secrets!")
-        api_key = st.text_input("Paste your Gemini API Key here (for testing only):", type="password")
-        if not api_key:
-            st.info("""
-            **To fix this permanently:**
-            1. Go to your app on [share.streamlit.io](https://share.streamlit.io)
-            2. Click ⋮ → **Settings** → **Secrets**
-            3. Add: `GEMINI_API_KEY = "your-key"`
-            4. Click **Save** and **Reboot**
-            """)
-            st.stop()
+if groq_key:
+    try:
+        from groq import Groq
+        groq_client = Groq(api_key=groq_key)
+    except Exception as e:
+        st.sidebar.error(f"Groq Error: {e}")
 
-    genai.configure(api_key=api_key)
-    st.success("✅ Gemini API connected successfully!")
+# ========== LOCAL EMBEDDING MODEL ==========
+@st.cache_resource
+def load_embedder():
+    with st.spinner("Loading embedding model (22MB, one-time)..."):
+        from fastembed import TextEmbedding
+        return TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
+embedder = None
+try:
+    embedder = load_embedder()
 except Exception as e:
-    st.error(f"❌ Error with API Key: {e}")
+    st.sidebar.error(f"Embedder Error: {e}")
+
+# ========== SESSION STATE ==========
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "embeddings" not in st.session_state:
+    st.session_state.embeddings = None
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+if "file_stats" not in st.session_state:
+    st.session_state.file_stats = []
+if "ready" not in st.session_state:
+    st.session_state.ready = False
+
+# ========== SIDEBAR ==========
+with st.sidebar:
+    st.header("🔌 Status")
+    if groq_client:
+        st.success("✅ Groq Connected")
+    else:
+        st.error("❌ No Groq API Key")
+        st.markdown("Get free key at [console.groq.com](https://console.groq.com)")
+    
+    if embedder:
+        st.success("✅ Local Embedder Ready")
+    
+    st.divider()
+    
+    # Document upload section
+    st.subheader("📄 Upload Documents")
+    uploaded_files = st.file_uploader(
+        "Drop PDF files here",
+        type=['pdf'],
+        accept_multiple_files=True,
+        label_visibility="collapsed"
+    )
+    
+    if uploaded_files:
+        if st.button("🚀 Process Documents", type="primary", use_container_width=True):
+            with st.spinner("Processing..."):
+                all_chunks = []
+                file_stats = []
+                
+                for pdf_file in uploaded_files:
+                    try:
+                        reader = PdfReader(pdf_file)
+                        text_parts = []
+                        for i, page in enumerate(reader.pages):
+                            txt = page.extract_text()
+                            if txt:
+                                text_parts.append(f"[Page {i+1}]\n{txt}")
+                        
+                        full_text = "\n\n".join(text_parts)
+                        pages = len(reader.pages)
+                        
+                        chunks = []
+                        start = 0
+                        while start < len(full_text):
+                            end = min(start + 1000, len(full_text))
+                            chunk = full_text[start:end].strip()
+                            if len(chunk) > 50:
+                                chunks.append(chunk)
+                            start = end - 150 if end < len(full_text) else end
+                        
+                        all_chunks.extend(chunks)
+                        file_stats.append({"name": pdf_file.name, "pages": pages, "chunks": len(chunks)})
+                    except Exception as e:
+                        st.error(f"Error with {pdf_file.name}: {e}")
+                
+                if not all_chunks:
+                    st.error("No text extracted. Try text-based PDFs.")
+                else:
+                    embeddings = []
+                    emb_progress = st.progress(0)
+                    
+                    for i, chunk in enumerate(all_chunks):
+                        try:
+                            emb_gen = embedder.embed([chunk[:8000]])
+                            emb = np.array(list(emb_gen)[0], dtype=np.float32)
+                            embeddings.append(emb)
+                        except Exception as e:
+                            st.error(f"Embed error chunk {i}: {e}")
+                        emb_progress.progress((i + 1) / len(all_chunks))
+                    
+                    if embeddings:
+                        st.session_state.embeddings = np.array(embeddings)
+                        st.session_state.chunks = all_chunks
+                        st.session_state.file_stats = file_stats
+                        st.session_state.ready = True
+                        st.success(f"✅ {len(uploaded_files)} files → {len(all_chunks)} chunks")
+                    else:
+                        st.error("❌ Failed to create embeddings.")
+    
+    if st.session_state.file_stats:
+        st.divider()
+        st.subheader("📊 Documents")
+        for s in st.session_state.file_stats:
+            st.write(f"📄 {s['name']}")
+            st.caption(f"{s['pages']} pages → {s['chunks']} chunks")
+    
+    if st.session_state.messages:
+        st.divider()
+        if st.button("🗑️ Clear Chat History", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+    
+    st.divider()
+    st.markdown("""
+    ### ⏱️ Free Tier
+    - **Groq**: 30 req/min
+    - **Embeddings**: Unlimited (local)
+    """)
+
+# ========== SETUP CHECK ==========
+if not groq_client or not embedder:
+    st.warning("⚠️ Setup Required")
+    st.markdown("""
+    ### Step 1: Get Groq API Key (Free, No Credit Card)
+    1. Go to https://console.groq.com
+    2. Sign up → API Keys → Create Key
+    
+    ### Step 2: Add to Streamlit Cloud Secrets
+    `GROQ_API_KEY = "your-key"`
+    
+    ### Step 3: Upload PDFs in the sidebar
+    """)
     st.stop()
 
-# ========== HELPER FUNCTIONS ==========
+if not st.session_state.ready:
+    st.info("👈 **Upload PDF files in the sidebar and click 'Process Documents' to start chatting.**")
+    st.markdown("""
+    ### 💡 How it works:
+    1. Upload your PDF documents in the sidebar
+    2. Click **Process Documents** — the AI reads and learns your files
+    3. Ask questions in the chat box below
+    4. The AI answers based ONLY on your documents
+    """)
+    st.stop()
 
-def get_embedding(text: str):
-    """Convert text to vector using Gemini Embedding (FREE tier)"""
-    try:
-        safe_text = text[:8000] if len(text) > 8000 else text
-        result = genai.embed_content(
-            model="models/embedding-001",
-            content=safe_text,
-            task_type="retrieval_document"
-        )
-        return np.array(result['embedding'], dtype=np.float32)
-    except Exception as e:
-        st.error(f"Embedding error: {e}")
-        return None
+# ========== CHAT INTERFACE ==========
+st.markdown("---")
 
-def cosine_similarity(a, b):
-    """Calculate similarity between two vectors (no FAISS needed!)"""
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        
+        # Show source chunks for assistant messages
+        if message["role"] == "assistant" and "sources" in message:
+            with st.expander("📄 View source chunks"):
+                for src in message["sources"]:
+                    st.markdown(f"**Chunk** (score: {src['score']:.3f})")
+                    st.text(src["text"][:600])
+                    st.divider()
 
-def get_answer(question: str, context: str) -> str:
-    """Ask Gemini Flash to answer based on retrieved context"""
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        prompt = f"""You are a helpful study assistant. Answer the question using ONLY the information provided in the context below.
+# Chat input at the bottom
+if prompt := st.chat_input("Ask anything about your documents..."):
+    # Add user message
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # Display user message immediately
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    
+    # Generate response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                # 1. Embed question
+                q_emb_gen = embedder.embed([prompt[:8000]])
+                q_vec = np.array(list(q_emb_gen)[0], dtype=np.float32)
+                
+                # 2. Find top 3 similar chunks
+                sims = []
+                for emb in st.session_state.embeddings:
+                    sim = np.dot(q_vec, emb) / (np.linalg.norm(q_vec) * np.linalg.norm(emb))
+                    sims.append(sim)
+                
+                top_idx = np.argsort(sims)[-3:][::-1]
+                
+                # 3. Build context
+                relevant_chunks = [st.session_state.chunks[i] for i in top_idx]
+                context = "\n\n---\n\n".join(relevant_chunks)
+                
+                # 4. Build chat-aware prompt (includes recent history for context)
+                recent_history = ""
+                if len(st.session_state.messages) > 2:
+                    recent = st.session_state.messages[-6:-1]  # Last 3 exchanges
+                    recent_history = "\n\n".join([
+                        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+                        for m in recent
+                    ])
+                
+                system_prompt = f"""You are a helpful study assistant. Answer the user's question using ONLY the information provided in the context below.
+If the answer is not found in the context, say: "I don't have enough information in the uploaded documents to answer this."
+
+=== CONTEXT FROM DOCUMENTS ===
+{context}
+
+=== RECENT CONVERSATION ===
+{recent_history}
+
+=== USER QUESTION ===
+{prompt}
+
+=== YOUR ANSWER ===
+Provide a clear, accurate, and concise answer.""" if recent_history else f"""You are a helpful study assistant. Answer the user's question using ONLY the information provided in the context below.
 If the answer is not found in the context, say: "I don't have enough information in the uploaded documents to answer this."
 
 === CONTEXT FROM DOCUMENTS ===
 {context}
 
 === USER QUESTION ===
-{question}
+{prompt}
 
 === YOUR ANSWER ===
 Provide a clear, accurate, and concise answer."""
-
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"❌ Error generating answer: {e}"
-
-def split_text(text: str, chunk_size: int = 1000, overlap: int = 150) -> list:
-    """Split long text into overlapping chunks"""
-    if not text or len(text) < chunk_size:
-        return [text] if text else []
-
-    chunks = []
-    start = 0
-    text_len = len(text)
-
-    while start < text_len:
-        end = min(start + chunk_size, text_len)
-
-        # Try to break at a natural boundary
-        if end < text_len:
-            for sep in ['. ', '\n', ' ']:
-                pos = text.rfind(sep, start, end)
-                if pos != -1:
-                    end = pos + len(sep)
-                    break
-
-        chunk = text[start:end].strip()
-        if chunk and len(chunk) > 50:
-            chunks.append(chunk)
-
-        start = end - overlap
-
-    return chunks
-
-def extract_pdf_text(pdf_file):
-    """Extract text from uploaded PDF file + return page count"""
-    try:
-        reader = PdfReader(pdf_file)
-        text_parts = []
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text()
-            if page_text and page_text.strip():
-                text_parts.append(f"[Page {i+1}]\n{page_text}")
-        full_text = "\n\n".join(text_parts)
-        page_count = len(reader.pages)
-        return full_text, page_count
-    except Exception as e:
-        st.error(f"Error reading {pdf_file.name}: {e}")
-        return "", 0
-
-# ========== MAIN APP ==========
-
-uploaded_files = st.file_uploader(
-    "📄 Upload your PDF files (you can select multiple)",
-    type=['pdf'],
-    accept_multiple_files=True
-)
-
-if not uploaded_files:
-    st.info("👆 **Get started:** Upload one or more PDF files above")
-    st.markdown("""
-    ### 💡 What is RAG?
-    **RAG** = **R**etrieval **A**ugmented **G**eneration
-
-    1. 📄 You upload documents
-    2. 🔍 The app finds the most relevant parts
-    3. 🤖 AI reads those parts and answers your question
-    4. ✅ You get accurate answers based on YOUR documents
-    """)
-    st.stop()
-
-# Process documents button
-if st.button("🚀 Process Documents", type="primary"):
-    with st.spinner("🔍 Reading and analyzing your documents..."):
-
-        all_chunks = []
-        file_stats = []
-
-        progress = st.progress(0)
-        for idx, pdf_file in enumerate(uploaded_files):
-            text, page_count = extract_pdf_text(pdf_file)
-            if text:
-                chunks = split_text(text)
-                all_chunks.extend(chunks)
-                file_stats.append({
-                    'name': pdf_file.name,
-                    'pages': page_count,
-                    'chunks': len(chunks)
+                
+                # 5. Call Groq
+                chat_completion = groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": system_prompt}],
+                    model="llama-3.3-70b-versatile",
+                    temperature=0.3,
+                    max_tokens=1024
+                )
+                
+                answer = chat_completion.choices[0].message.content
+                
+                # 6. Prepare sources
+                sources = []
+                for i, idx in enumerate(top_idx):
+                    sources.append({
+                        "text": st.session_state.chunks[idx],
+                        "score": sims[idx]
+                    })
+                
+                # 7. Display answer
+                st.markdown(answer)
+                
+                with st.expander("📄 View source chunks"):
+                    for src in sources:
+                        st.markdown(f"**Chunk** (score: {src['score']:.3f})")
+                        st.text(src["text"][:600])
+                        st.divider()
+                
+                # 8. Save to history
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": sources
                 })
-            progress.progress((idx + 1) / len(uploaded_files))
-
-        if not all_chunks:
-            st.error("❌ Could not extract text from the uploaded PDFs. Try different files.")
-            st.stop()
-
-        # Create embeddings for each chunk
-        st.write(f"🧠 Creating {len(all_chunks)} embeddings...")
-        embed_progress = st.progress(0)
-        embeddings = []
-
-        for i, chunk in enumerate(all_chunks):
-            emb = get_embedding(chunk)
-            if emb is not None:
-                embeddings.append(emb)
-            embed_progress.progress((i + 1) / len(all_chunks))
-
-        if not embeddings:
-            st.error("❌ Failed to create embeddings. Check your API key and internet connection.")
-            st.stop()
-
-        # Store in session state
-        st.session_state['embeddings'] = embeddings
-        st.session_state['chunks'] = all_chunks
-        st.session_state['file_stats'] = file_stats
-        st.session_state['ready'] = True
-
-        st.success(f"✅ Ready! Processed {len(uploaded_files)} file(s) into {len(all_chunks)} searchable chunks.")
-
-# Show file stats in sidebar
-with st.sidebar:
-    st.header("📊 Document Stats")
-    if 'file_stats' in st.session_state:
-        for stat in st.session_state['file_stats']:
-            st.markdown(f"**{stat['name']}**")
-            st.markdown(f"- Pages: {stat['pages']} | Chunks: {stat['chunks']}")
-    else:
-        st.info("Upload and process documents to see stats")
-
-    st.divider()
-    st.markdown("""
-    ### 🛠️ Tech Stack
-    - **UI**: Streamlit (Free)
-    - **AI**: Gemini 2.0 Flash (Free tier)
-    - **Embeddings**: Gemini Embedding (Free tier)
-    - **Search**: Pure Python (No FAISS needed!)
-    - **PDF**: PyPDF (Open source)
-    """)
-
-# Question & Answer section
-if st.session_state.get('ready', False):
-    st.divider()
-    st.subheader("❓ Ask Your Documents")
-
-    question = st.text_input(
-        "Type your question here:",
-        placeholder="e.g., What are the main findings? Who is the author?"
-    )
-
-    if question:
-        with st.spinner("🔎 Searching documents and generating answer..."):
-            # 1. Embed the question
-            q_emb = get_embedding(question)
-            if q_emb is None:
-                st.stop()
-
-            # 2. Find top 3 most similar chunks using cosine similarity (no FAISS!)
-            similarities = []
-            for emb in st.session_state['embeddings']:
-                sim = cosine_similarity(q_emb, emb)
-                similarities.append(sim)
-
-            # Get indices of top 3
-            top_indices = np.argsort(similarities)[-3:][::-1]
-
-            # 3. Retrieve the actual text chunks
-            relevant_chunks = [st.session_state['chunks'][i] for i in top_indices]
-            context = "\n\n---\n\n".join(relevant_chunks)
-
-            # 4. Ask Gemini to answer
-            answer = get_answer(question, context)
-
-            # 5. Display results
-            st.markdown("### 💡 Answer")
-            st.info(answer)
-
-            with st.expander("📄 View source text chunks used to generate this answer"):
-                for i, idx in enumerate(top_indices):
-                    chunk = st.session_state['chunks'][idx]
-                    score = similarities[idx]
-                    st.markdown(f"**Relevant Chunk {i+1}** *(similarity: {score:.3f})*")
-                    st.text_area(f"chunk_{i}", chunk[:800] + ("..." if len(chunk) > 800 else ""), 
-                                height=120, label_visibility="collapsed")
-                    st.divider()
+            
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg:
+                    st.error("⏳ Rate limit (30/min). Wait a few seconds and try again.")
+                else:
+                    st.error(f"Error: {e}")
